@@ -1,0 +1,13 @@
+# Ignore everything by default
+*
+
+# Allow specific files
+!Dockerfile
+!docker-compose.yml
+!pyproject.toml
+!uv.lock
+!app/
+!app/**/*.py
+
+# Ignore pycache even if allowed
+**/__pycache__
