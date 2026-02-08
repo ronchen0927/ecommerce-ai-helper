@@ -1,4 +1,6 @@
+"""Celery application configuration for async task processing."""
 from celery import Celery
+
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -11,12 +13,35 @@ celery_app = Celery(
 )
 
 celery_app.conf.update(
+    # Serialization
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
+
+    # Timezone
     timezone="Asia/Taipei",
     enable_utc=True,
+
+    # Task tracking
     task_track_started=True,
-    task_time_limit=600,  # 10 minutes max per task
-    worker_prefetch_multiplier=1,  # For long-running tasks
+
+    # Reliability settings
+    task_acks_late=settings.celery_task_acks_late,
+    worker_prefetch_multiplier=settings.celery_worker_prefetch_multiplier,
+    task_time_limit=settings.celery_task_time_limit,
+    task_soft_time_limit=settings.celery_task_time_limit - 30,  # 30s grace period
+    result_expires=settings.celery_result_expires,
+
+    # Retry settings
+    task_reject_on_worker_lost=True,
+    task_default_retry_delay=30,  # 30 seconds
+    task_max_retries=3,
+
+    # Connection settings
+    broker_connection_retry_on_startup=True,
+    broker_connection_max_retries=10,
+    broker_pool_limit=settings.redis_max_connections,
+
+    # Result settings
+    result_extended=True,  # Store task args/kwargs in result
 )

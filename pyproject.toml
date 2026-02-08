@@ -19,6 +19,7 @@ dependencies = [
     "torchvision>=0.17.0",
     "scikit-image>=0.22.0",
     "numpy>=1.26.0",
+    "python-jose[cryptography]>=3.5.0",
 ]
 
 [tool.uv]

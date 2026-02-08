@@ -17,7 +17,7 @@ from app.schemas.task import (
     TaskStatusResponse,
     UploadResponse,
 )
-from app.services.storage import LocalStorage, StorageService
+from app.services.storage import GCSStorage, LocalStorage, StorageService
 
 router = APIRouter(prefix="/api/v1", tags=["tasks"])
 
@@ -26,8 +26,12 @@ def get_storage_service(
     settings: Settings = Depends(get_settings),
 ) -> StorageService:
     """Dependency to get storage service based on configuration."""
-    if settings.storage_type == "local":
-        return LocalStorage(base_dir=Path(settings.local_storage_path))
+    if settings.storage_type == "gcs":
+        return GCSStorage(
+            bucket_name=settings.gcs_bucket_name,
+            project_id=settings.gcs_project_id,
+            credentials_path=settings.gcs_credentials_path,
+        )
     return LocalStorage(base_dir=Path(settings.local_storage_path))
 
 
