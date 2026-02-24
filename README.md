@@ -29,6 +29,27 @@ uv run uvicorn app.main:app --reload
 uv run celery -A app.core.celery_app worker --loglevel=info
 ```
 
+## Example Prompts
+
+Here are some effective prompts for the `scene_prompt` parameter to get the best results for e-commerce products:
+
+### Minimal & Clean (Best for Tech/Gadgets)
+
+- `professional product photography, clean white studio background, soft studio lighting, sharp focus, 8k resolution, photorealistic`
+- `product resting on a sleek black marble podium, dark studio styling, dramatic rim lighting, premium aesthetic, highly detailed`
+
+### Lifestyle & Contextual (Best for Fashion/Home)
+
+- `product placed on a cozy wooden table, blurred bright cafe background in the morning, soft warm sunlight filtering through a window, shallow depth of field`
+- `skincare bottle on a natural stone block, surrounded by subtle green palm shadows, bright airy bathroom setting, spa atmosphere, photorealistic`
+
+### Creative & Vibrant (Best for Cosmetics/Beverages)
+
+- `product floating in crystal clear splashing water, bright summer lighting, turquoise background, high speed photography, refreshing vibe`
+- `product surrounded by floating pastel geometric shapes, vibrant studio lighting, pop art style, clean colorful background, 4k`
+
+> **Pro Tip**: Always append modifiers like `professional product photography`, `studio lighting`, or `photorealistic` to steer the model toward commercial quality.
+
 ## API Endpoints
 
 | Method | Endpoint | Description |
