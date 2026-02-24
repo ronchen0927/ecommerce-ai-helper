@@ -178,7 +178,7 @@ def _load_iclight_model() -> tuple[Any, Any, Any, Any]:
 
     # Move to device with float16
     text_encoder = text_encoder.to(device=_iclight_device, dtype=torch.float16)
-    vae = vae.to(device=_iclight_device, dtype=torch.bfloat16)
+    vae = vae.to(device=_iclight_device, dtype=torch.float16)
     unet = unet.to(device=_iclight_device, dtype=torch.float16)
 
     # Use SDP attention
@@ -208,9 +208,13 @@ def _load_iclight_model() -> tuple[Any, Any, Any, Any]:
         image_encoder=None,
     )
 
-    _iclight_t2i_pipe = StableDiffusionPipeline(**pipe_kwargs)
-    _iclight_i2i_pipe = StableDiffusionImg2ImgPipeline(**pipe_kwargs)
+    _iclight_t2i_pipe = StableDiffusionPipeline(**pipe_kwargs).to(_iclight_device)
+    _iclight_i2i_pipe = StableDiffusionImg2ImgPipeline(**pipe_kwargs).to(_iclight_device)
     _iclight_vae = vae
+
+    # Optimize for VRAM
+    _iclight_t2i_pipe.enable_attention_slicing()
+    _iclight_i2i_pipe.enable_attention_slicing()
 
     logger.info("IC-Light FBC model loaded successfully")
     return _iclight_t2i_pipe, _iclight_i2i_pipe, _iclight_vae, _iclight_device
@@ -650,47 +654,40 @@ class RelightingService(AIService):
         hr_h = int(round(image_height * highres_scale / 64.0) * 64)
         pixels_np = [_resize_without_crop(p, hr_w, hr_h) for p in pixels_np]
 
-        pixels_t = _numpy2pytorch(pixels_np).to(device=vae.device, dtype=vae.dtype)
-        latents = vae.encode(pixels_t).latent_dist.mode() * vae.config.scaling_factor
-        latents = latents.to(device=device, dtype=torch.float16)
+        # Use upscaled pixels for img2img (don't manually encode back to latents)
+        pixels_t = (
+            _numpy2pytorch(pixels_np).to(device=vae.device, dtype=vae.dtype).half()
+        )
 
         # Recalculate hr dimensions and re-encode conditions
-        hr_height = latents.shape[2] * 8
-        hr_width = latents.shape[3] * 8
+        hr_height, hr_width = pixels_t.shape[2], pixels_t.shape[3]
         fg_hr = _resize_and_center_crop(fg_img, hr_width, hr_height)
         bg_hr = _resize_and_center_crop(bg_img, hr_width, hr_height)
         concat_hr = _numpy2pytorch([fg_hr, bg_hr]).to(
             device=vae.device, dtype=vae.dtype
         )
-        concat_hr = vae.encode(concat_hr).latent_dist.mode() * vae.config.scaling_factor
+        concat_hr = (
+            vae.encode(concat_hr).latent_dist.mode() * vae.config.scaling_factor
+        )
         concat_hr = torch.cat([c[None, ...] for c in concat_hr], dim=1)
 
         # Second pass: img2img highres
-        latents = (
-            i2i_pipe(
-                image=latents,
-                strength=highres_denoise,
-                prompt_embeds=conds,
-                negative_prompt_embeds=unconds,
-                width=hr_width,
-                height=hr_height,
-                num_inference_steps=int(round(steps / highres_denoise)),
-                num_images_per_prompt=1,
-                generator=rng,
-                output_type="latent",
-                guidance_scale=cfg,
-                cross_attention_kwargs={"concat_conds": concat_hr},
-            ).images.to(vae.dtype)
-            / vae.config.scaling_factor
-        )
-
-        # Final decode
-        pixels = vae.decode(latents).sample
-        final_np = _pytorch2numpy(pixels)
+        final_images = i2i_pipe(
+            image=pixels_t,
+            strength=highres_denoise,
+            prompt_embeds=conds,
+            negative_prompt_embeds=unconds,
+            num_inference_steps=int(round(steps / highres_denoise)),
+            num_images_per_prompt=1,
+            generator=rng,
+            output_type="np",
+            guidance_scale=cfg,
+            cross_attention_kwargs={"concat_conds": concat_hr},
+        ).images
 
         # Save result
         output_path = Path(fg_path).parent / "relit.png"
-        Image.fromarray(final_np[0]).save(output_path, "PNG")
+        Image.fromarray(final_images[0]).save(output_path, "PNG")
 
         logger.info(f"Relighting completed via local IC-Light: {output_path}")
         return str(output_path)
