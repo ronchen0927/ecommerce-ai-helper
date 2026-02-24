@@ -97,7 +97,7 @@ def process_image(
         self.update_task_status(task_id, TaskStatus.RELIGHTING)
         relight_service = AIServiceFactory.get_relighting_service()
         local_final = run_async(
-            relight_service.process(local_bg_removed, background_path=local_scene)
+            relight_service.process(local_bg_removed, background_path=local_scene, prompt=prompt)
         )
 
         # 4. Upload final result back to storage
