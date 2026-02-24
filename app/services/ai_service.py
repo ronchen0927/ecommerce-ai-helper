@@ -38,6 +38,10 @@ _iclight_i2i_pipe: Any = None
 _iclight_vae: Any = None
 _iclight_device: Any = None
 
+# Scene Generation module-level state
+_scene_pipe: Any = None
+_scene_device: Any = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -89,6 +93,34 @@ def _load_rmbg_model() -> tuple[Any, Any]:
     logger.info("RMBG-1.4 model loaded successfully")
 
     return _rmbg_model, _torch_device
+
+
+def _load_scene_model() -> tuple[Any, Any]:
+    """
+    Lazy load SD 1.5 for local scene generation.
+    """
+    global _scene_pipe, _scene_device
+
+    if _scene_pipe is not None:
+        return _scene_pipe, _scene_device
+
+    from diffusers import StableDiffusionPipeline
+    import torch
+
+    _scene_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Loading Local Scene Gen Model (SD 1.5) on {_scene_device}...")
+
+    _scene_pipe = StableDiffusionPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5",
+        torch_dtype=torch.float16,
+        safety_checker=None,
+    )
+    
+    # Memory optimization
+    _scene_pipe.enable_attention_slicing()
+
+    logger.info("Local Scene Gen Model loaded successfully")
+    return _scene_pipe, _scene_device
 
 
 def _load_iclight_model() -> tuple[Any, Any, Any, Any]:
@@ -272,6 +304,29 @@ def _resize_and_center_crop(
     bottom = (resized_height + target_height) / 2
     cropped_image = resized_image.crop((left, top, right, bottom))
     return np.array(cropped_image)
+
+
+def _resize_and_pad(
+    image: np.ndarray, target_width: int, target_height: int, pad_color: tuple = (127, 127, 127)
+) -> np.ndarray:
+    """Resize image preserving aspect ratio and pad to target dimensions."""
+    pil_image = Image.fromarray(image)
+    original_width, original_height = pil_image.size
+    
+    scale_factor = min(target_width / original_width, target_height / original_height)
+    resized_width = int(round(original_width * scale_factor))
+    resized_height = int(round(original_height * scale_factor))
+    
+    resized_image = pil_image.resize(
+        (resized_width, resized_height), Image.Resampling.LANCZOS
+    )
+    
+    new_image = Image.new("RGB", (target_width, target_height), pad_color)
+    paste_x = (target_width - resized_width) // 2
+    paste_y = (target_height - resized_height) // 2
+    new_image.paste(resized_image, (paste_x, paste_y))
+    
+    return np.array(new_image)
 
 
 def _resize_without_crop(
@@ -528,11 +583,34 @@ class SceneGenerationService(AIService):
                 f.write(base64.b64decode(result_b64))
             return str(output_path)
 
+    @torch.inference_mode()
     async def _process_local(self, image_path: str, prompt: str) -> str:
-        """Local processing placeholder."""
+        """Process using local SD 1.5 pipeline."""
+        pipe, device = _load_scene_model()
+        
+        # Move pipe to GPU before generation
+        pipe = pipe.to(device)
+
+        # Typical negative prompt for better quality
+        n_prompt = "lowres, bad anatomy, bad quality, worst quality, text, watermark"
+        generator = torch.Generator(device=device).manual_seed(42)
+
+        image = pipe(
+            prompt,
+            negative_prompt=n_prompt,
+            num_inference_steps=30,
+            guidance_scale=7.5,
+            generator=generator,
+        ).images[0]
+
+        # Move pipe to CPU explicitly and clear cache
+        pipe = pipe.to("cpu")
+        torch.cuda.empty_cache()
+
         output_path = Path(image_path).parent / "scene.png"
-        img = Image.new("RGB", (1024, 1024), color=(240, 240, 245))
-        img.save(output_path, "PNG")
+        image.save(output_path, "PNG")
+
+        logger.info(f"Scene generated via local SD 1.5: {output_path}")
         return str(output_path)
 
 
@@ -601,7 +679,7 @@ class RelightingService(AIService):
         # Parameters
         image_width, image_height = 512, 512
         steps, cfg = 25, 2.0
-        highres_scale, highres_denoise = 1.5, 0.5
+        highres_scale, highres_denoise = 1.0, 0.35
         seed = 12345
         a_prompt = "best quality, high detail"
         n_prompt = "lowres, bad anatomy, bad hands, cropped, worst quality"
@@ -609,12 +687,19 @@ class RelightingService(AIService):
         rng = torch.Generator(device=device).manual_seed(seed)
 
         # Load and resize images
-        fg_img = np.array(Image.open(fg_path).convert("RGB"))
-        fg = _resize_and_center_crop(fg_img, image_width, image_height)
+        fg_pil = Image.open(fg_path)
+        if fg_pil.mode == "RGBA":
+            bg_gray = Image.new("RGB", fg_pil.size, (127, 127, 127))
+            bg_gray.paste(fg_pil, mask=fg_pil.split()[3])
+            fg_img = np.array(bg_gray)
+        else:
+            fg_img = np.array(fg_pil.convert("RGB"))
+            
+        fg = _resize_and_pad(fg_img, image_width, image_height)
 
         if bg_path and Path(bg_path).exists():
             bg_img = np.array(Image.open(bg_path).convert("RGB"))
-            bg = _resize_and_center_crop(bg_img, image_width, image_height)
+            bg = _resize_and_pad(bg_img, image_width, image_height)
         else:
             bg = np.zeros((image_height, image_width, 3), dtype=np.uint8) + 64
             bg_img = bg
@@ -671,8 +756,8 @@ class RelightingService(AIService):
         hr_pil = Image.fromarray(pixels_np[0])
 
         # Recalculate hr dimensions and re-encode conditions
-        fg_hr = _resize_and_center_crop(fg_img, hr_w, hr_h)
-        bg_hr = _resize_and_center_crop(bg_img, hr_w, hr_h)
+        fg_hr = _resize_and_pad(fg_img, hr_w, hr_h)
+        bg_hr = _resize_and_pad(bg_img, hr_w, hr_h)
         concat_hr = _numpy2pytorch([fg_hr, bg_hr]).to(
             device=vae.device, dtype=vae.dtype
         )
