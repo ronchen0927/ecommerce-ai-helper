@@ -145,12 +145,19 @@ def _load_iclight_model() -> tuple[Any, Any, Any, Any]:
     def hooked_unet_forward(
         sample: Any, timestep: Any, encoder_hidden_states: Any, **kwargs: Any
     ) -> Any:
-        c_concat = kwargs["cross_attention_kwargs"]["concat_conds"].to(sample)
-        c_concat = torch.cat([c_concat] * (sample.shape[0] // c_concat.shape[0]), dim=0)
-        new_sample = torch.cat([sample, c_concat], dim=1)
-        kwargs["cross_attention_kwargs"] = {}
+        # Avoid modifying kwargs in-place for multi-call stability
+        ca_kwargs = kwargs.get("cross_attention_kwargs", {}).copy()
+        c_concat = ca_kwargs.pop("concat_conds", None)
+
+        if c_concat is not None:
+            c_concat = c_concat.to(sample)
+            c_concat = torch.cat(
+                [c_concat] * (sample.shape[0] // c_concat.shape[0]), dim=0
+            )
+            sample = torch.cat([sample, c_concat], dim=1)
+
         return unet_original_forward(
-            new_sample, timestep, encoder_hidden_states, **kwargs
+            sample, timestep, encoder_hidden_states, cross_attention_kwargs=ca_kwargs
         )
 
     unet.forward = hooked_unet_forward
@@ -176,9 +183,9 @@ def _load_iclight_model() -> tuple[Any, Any, Any, Any]:
     unet.load_state_dict(sd_merged, strict=True)
     del sd_offset, sd_origin, sd_merged
 
-    # Move to device with float16
+    # Move to device with float16 (VAE on float32 for stability)
     text_encoder = text_encoder.to(device=_iclight_device, dtype=torch.float16)
-    vae = vae.to(device=_iclight_device, dtype=torch.float16)
+    vae = vae.to(device=_iclight_device, dtype=torch.float32)
     unet = unet.to(device=_iclight_device, dtype=torch.float16)
 
     # Use SDP attention
@@ -684,7 +691,10 @@ class RelightingService(AIService):
 
         # Save result
         output_path = Path(fg_path).parent / "relit.png"
-        Image.fromarray(final_images[0]).save(output_path, "PNG")
+        
+        # Convert from [0, 1] float32 to [0, 255] uint8
+        final_image_np = (final_images[0] * 255).clip(0, 255).astype(np.uint8)
+        Image.fromarray(final_image_np).save(output_path, "PNG")
 
         logger.info(f"Relighting completed via local IC-Light: {output_path}")
         return str(output_path)

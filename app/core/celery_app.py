@@ -43,11 +43,7 @@ celery_app.conf.update(
 
 # SSL configuration for rediss:// URLs (e.g., Upstash)
 if settings.celery_broker_url.startswith("rediss://"):
-    celery_app.conf.update(
-        broker_use_ssl={"ssl_cert_reqs": 0},  # 0 corresponds to CERT_NONE
-    )
+    celery_app.conf.broker_use_ssl = {"ssl_cert_reqs": "none"}
 
 if settings.celery_result_backend.startswith("rediss://"):
-    celery_app.conf.update(
-        redis_backend_use_ssl={"ssl_cert_reqs": 0},
-    )
+    celery_app.conf.redis_backend_use_ssl = {"ssl_cert_reqs": "none"}
