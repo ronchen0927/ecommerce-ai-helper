@@ -600,7 +600,10 @@ class SceneGenerationService(AIService):
         # Typical negative prompt for better quality
         base_n_prompt = "lowres, bad anatomy, bad quality, worst quality, text, watermark, other objects, other products, bottles, props, distracting elements, cluttered, human, person, hands, arms, fingers"
         n_prompt = f"{base_n_prompt}, {negative_prompt}" if negative_prompt else base_n_prompt
-        generator = torch.Generator(device=device).manual_seed(42)
+        
+        # Use a random seed instead of deterministic 42
+        seed = int(torch.randint(0, 2147483647, (1,)).item())
+        generator = torch.Generator(device=device).manual_seed(seed)
 
         image = pipe(
             bg_prompt,
@@ -689,7 +692,8 @@ class RelightingService(AIService):
         image_width, image_height = 512, 512
         steps, cfg = 25, 2.0
         highres_scale, highres_denoise = 1.0, 0.35
-        seed = 12345
+        # Use a random seed instead of deterministic 12345
+        seed = int(torch.randint(0, 2147483647, (1,)).item())
         a_prompt = "best quality, high detail"
         
         base_n_prompt = "lowres, bad anatomy, bad hands, cropped, worst quality, other objects, other products, bottles, props, distracting elements, cluttered, human, person, hands, arms, fingers"
