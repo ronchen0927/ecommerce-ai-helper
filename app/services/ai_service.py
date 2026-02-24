@@ -654,15 +654,12 @@ class RelightingService(AIService):
         hr_h = int(round(image_height * highres_scale / 64.0) * 64)
         pixels_np = [_resize_without_crop(p, hr_w, hr_h) for p in pixels_np]
 
-        # Use upscaled pixels for img2img (don't manually encode back to latents)
-        pixels_t = (
-            _numpy2pytorch(pixels_np).to(device=vae.device, dtype=vae.dtype).half()
-        )
+        # Use PIL image for img2img to avoid range issues and ensure optimization
+        hr_pil = Image.fromarray(pixels_np[0])
 
         # Recalculate hr dimensions and re-encode conditions
-        hr_height, hr_width = pixels_t.shape[2], pixels_t.shape[3]
-        fg_hr = _resize_and_center_crop(fg_img, hr_width, hr_height)
-        bg_hr = _resize_and_center_crop(bg_img, hr_width, hr_height)
+        fg_hr = _resize_and_center_crop(fg_img, hr_w, hr_h)
+        bg_hr = _resize_and_center_crop(bg_img, hr_w, hr_h)
         concat_hr = _numpy2pytorch([fg_hr, bg_hr]).to(
             device=vae.device, dtype=vae.dtype
         )
@@ -673,7 +670,7 @@ class RelightingService(AIService):
 
         # Second pass: img2img highres
         final_images = i2i_pipe(
-            image=pixels_t,
+            image=hr_pil,
             strength=highres_denoise,
             prompt_embeds=conds,
             negative_prompt_embeds=unconds,
