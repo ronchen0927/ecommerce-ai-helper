@@ -23,6 +23,7 @@ dependencies = [
     "diffusers>=0.27.0",
     "safetensors>=0.4.0",
     "accelerate>=0.27.0",
+    "flower>=2.0.1",
 ]
 
 [tool.uv]
