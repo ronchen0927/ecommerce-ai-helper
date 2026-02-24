@@ -45,6 +45,7 @@ task_metadata_store: dict[str, dict[str, Any]] = {}
 async def upload_image(
     file: UploadFile = File(...),
     scene_prompt: Optional[str] = Form(None),
+    negative_prompt: Optional[str] = Form(None),
     storage: StorageService = Depends(get_storage_service),
 ) -> UploadResponse:
     """
@@ -82,12 +83,13 @@ async def upload_image(
         "updated_at": now,
         "original_url": stored_path,
         "scene_prompt": scene_prompt,
+        "negative_prompt": negative_prompt,
     }
 
     # Queue the processing task - returns Celery task ID
     celery_task = celery_app.send_task(
         "app.tasks.image_processing.process_image",
-        args=[task_id, stored_path, scene_prompt],
+        args=[task_id, stored_path, scene_prompt, negative_prompt],
         task_id=task_id,  # Use same ID for easy lookup
     )
 

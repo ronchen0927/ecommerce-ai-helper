@@ -55,6 +55,7 @@ def process_image(
     task_id: str,
     image_path: str,
     scene_prompt: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
 ) -> dict[str, str]:
     """
     Main image processing pipeline (Hybrid GCS/Local Support).
@@ -91,13 +92,13 @@ def process_image(
         self.update_task_status(task_id, TaskStatus.GENERATING_SCENE)
         scene_service = AIServiceFactory.get_scene_generation_service()
         prompt = scene_prompt or "top-down view, flat lay photography, product placed exactly on the surface, professional product photography, studio lighting, contact shadow"
-        local_scene = run_async(scene_service.process(local_bg_removed, prompt=prompt))
+        local_scene = run_async(scene_service.process(local_bg_removed, prompt=prompt, negative_prompt=negative_prompt))
 
         # Stage 3: Relighting
         self.update_task_status(task_id, TaskStatus.RELIGHTING)
         relight_service = AIServiceFactory.get_relighting_service()
         local_final = run_async(
-            relight_service.process(local_bg_removed, background_path=local_scene, prompt=prompt)
+            relight_service.process(local_bg_removed, background_path=local_scene, prompt=prompt, negative_prompt=negative_prompt)
         )
 
         # 4. Upload final result back to storage

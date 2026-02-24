@@ -541,20 +541,23 @@ class SceneGenerationService(AIService):
         prompt = kwargs.get(
             "prompt", "professional product photography, studio lighting"
         )
+        negative_prompt = kwargs.get("negative_prompt")
         if not self.api_url:
-            return await self._process_local(image_path, prompt)
-        return await self._process_api(image_path, prompt)
+            return await self._process_local(image_path, prompt, negative_prompt)
+        return await self._process_api(image_path, prompt, negative_prompt)
 
-    async def _process_api(self, image_path: str, prompt: str) -> str:
+    async def _process_api(self, image_path: str, prompt: str, negative_prompt: Optional[str] = None) -> str:
         """Process using remote API (Flux/SDXL)."""
         async with httpx.AsyncClient(timeout=180.0) as client:
             with open(image_path, "rb") as f:
                 image_data = f.read()
             image_b64 = base64.b64encode(image_data).decode("utf-8")
+            base_n_prompt = "blurry, low quality, distorted"
+            n_prompt = f"{base_n_prompt}, {negative_prompt}" if negative_prompt else base_n_prompt
             payload = {
                 "image": image_b64,
                 "prompt": prompt,
-                "negative_prompt": "blurry, low quality, distorted",
+                "negative_prompt": n_prompt,
                 "num_inference_steps": 30,
                 "guidance_scale": 7.5,
             }
@@ -584,19 +587,23 @@ class SceneGenerationService(AIService):
             return str(output_path)
 
     @torch.inference_mode()
-    async def _process_local(self, image_path: str, prompt: str) -> str:
+    async def _process_local(self, image_path: str, prompt: str, negative_prompt: Optional[str] = None) -> str:
         """Process using local SD 1.5 pipeline."""
         pipe, device = _load_scene_model()
         
         # Move pipe to GPU before generation
         pipe = pipe.to(device)
 
+        # Force SD to generate an empty scene without objects
+        bg_prompt = f"empty background scene, empty surface, no objects, {prompt}"
+
         # Typical negative prompt for better quality
-        n_prompt = "lowres, bad anatomy, bad quality, worst quality, text, watermark"
+        base_n_prompt = "lowres, bad anatomy, bad quality, worst quality, text, watermark, other objects, other products, bottles, props, distracting elements, cluttered, human, person, hands, arms, fingers"
+        n_prompt = f"{base_n_prompt}, {negative_prompt}" if negative_prompt else base_n_prompt
         generator = torch.Generator(device=device).manual_seed(42)
 
         image = pipe(
-            prompt,
+            bg_prompt,
             negative_prompt=n_prompt,
             num_inference_steps=30,
             guidance_scale=7.5,
@@ -638,16 +645,18 @@ class RelightingService(AIService):
             image_path: Path to the foreground image (RGBA).
             background_path: Path to the background image.
             prompt: Text description of desired lighting.
+            negative_prompt: Text description to exclude elements.
         """
         background_path = kwargs.get("background_path", "")
         prompt = kwargs.get(
             "prompt", "top-down view, flat lay photography, product placed exactly on the surface, professional product photography, studio lighting, contact shadow"
         )
+        negative_prompt = kwargs.get("negative_prompt")
 
         if self.use_local_model:
             try:
                 return await self._process_local_model(
-                    image_path, background_path, prompt
+                    image_path, background_path, prompt, negative_prompt
                 )
             except Exception as e:
                 import traceback
@@ -667,7 +676,7 @@ class RelightingService(AIService):
 
     @torch.inference_mode()
     async def _process_local_model(
-        self, fg_path: str, bg_path: str, prompt: str
+        self, fg_path: str, bg_path: str, prompt: str, negative_prompt: Optional[str] = None
     ) -> str:
         """
         Process using local IC-Light FBC model on GPU.
@@ -682,7 +691,9 @@ class RelightingService(AIService):
         highres_scale, highres_denoise = 1.0, 0.35
         seed = 12345
         a_prompt = "best quality, high detail"
-        n_prompt = "lowres, bad anatomy, bad hands, cropped, worst quality"
+        
+        base_n_prompt = "lowres, bad anatomy, bad hands, cropped, worst quality, other objects, other products, bottles, props, distracting elements, cluttered, human, person, hands, arms, fingers"
+        n_prompt = f"{base_n_prompt}, {negative_prompt}" if negative_prompt else base_n_prompt
 
         rng = torch.Generator(device=device).manual_seed(seed)
 
