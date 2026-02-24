@@ -785,7 +785,24 @@ class RelightingService(AIService):
         
         # Convert from [0, 1] float32 to [0, 255] uint8
         final_image_np = (final_images[0] * 255).clip(0, 255).astype(np.uint8)
-        Image.fromarray(final_image_np).save(output_path, "PNG")
+        out_pil = Image.fromarray(final_image_np)
+
+        # Composite original pristine foreground back to preserve sharp text and details
+        if fg_pil.mode == "RGBA":
+            scale_factor = min(hr_w / fg_pil.width, hr_h / fg_pil.height)
+            resized_w = int(round(fg_pil.width * scale_factor))
+            resized_h = int(round(fg_pil.height * scale_factor))
+            
+            resized_fg_pil = fg_pil.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
+            
+            transparent_layer = Image.new("RGBA", (hr_w, hr_h), (0, 0, 0, 0))
+            paste_x = (hr_w - resized_w) // 2
+            paste_y = (hr_h - resized_h) // 2
+            transparent_layer.paste(resized_fg_pil, (paste_x, paste_y))
+            
+            out_pil = Image.alpha_composite(out_pil.convert("RGBA"), transparent_layer).convert("RGB")
+
+        out_pil.save(output_path, "PNG")
 
         logger.info(f"Relighting completed via local IC-Light: {output_path}")
         return str(output_path)
