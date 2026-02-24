@@ -641,7 +641,7 @@ class RelightingService(AIService):
         """
         background_path = kwargs.get("background_path", "")
         prompt = kwargs.get(
-            "prompt", "professional product photography, studio lighting"
+            "prompt", "top-down view, flat lay photography, product placed exactly on the surface, professional product photography, studio lighting, contact shadow"
         )
 
         if self.use_local_model:

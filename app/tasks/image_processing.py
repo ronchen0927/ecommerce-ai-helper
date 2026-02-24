@@ -90,7 +90,7 @@ def process_image(
         # Stage 2: Scene Generation
         self.update_task_status(task_id, TaskStatus.GENERATING_SCENE)
         scene_service = AIServiceFactory.get_scene_generation_service()
-        prompt = scene_prompt or "professional product photography, studio lighting"
+        prompt = scene_prompt or "top-down view, flat lay photography, product placed exactly on the surface, professional product photography, studio lighting, contact shadow"
         local_scene = run_async(scene_service.process(local_bg_removed, prompt=prompt))
 
         # Stage 3: Relighting
