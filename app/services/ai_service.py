@@ -4,11 +4,13 @@ AI Service module for image processing pipeline.
 This module provides async interfaces to various AI models:
 - RMBG-1.4 for background removal (local model first, API fallback)
 - Flux/SDXL for scene generation
-- IC-Light for relighting
+- IC-Light for relighting (local model first, API fallback)
 """
+
 # Standard library imports
 import base64
 import logging
+import math
 from pathlib import Path
 from typing import Any, Optional
 
@@ -30,11 +32,18 @@ from app.core.config import get_settings
 _rmbg_model: Any = None
 _torch_device: Any = None
 
+# IC-Light module-level state
+_iclight_t2i_pipe: Any = None
+_iclight_i2i_pipe: Any = None
+_iclight_vae: Any = None
+_iclight_device: Any = None
+
 logger = logging.getLogger(__name__)
 
 
 class AIServiceError(Exception):
     """Base exception for AI service errors."""
+
     pass
 
 
@@ -73,8 +82,7 @@ def _load_rmbg_model() -> tuple[Any, Any]:
 
     logger.info(f"Loading RMBG-1.4 model on {_torch_device}...")
     _rmbg_model = AutoModelForImageSegmentation.from_pretrained(
-        "briaai/RMBG-1.4",
-        trust_remote_code=True
+        "briaai/RMBG-1.4", trust_remote_code=True
     )
     _rmbg_model.to(_torch_device)
     _rmbg_model.eval()
@@ -83,13 +91,243 @@ def _load_rmbg_model() -> tuple[Any, Any]:
     return _rmbg_model, _torch_device
 
 
+def _load_iclight_model() -> tuple[Any, Any, Any, Any]:
+    """
+    Lazy load IC-Light FBC model pipeline.
+
+    Returns:
+        Tuple of (t2i_pipe, i2i_pipe, vae, device)
+    """
+    global _iclight_t2i_pipe, _iclight_i2i_pipe, _iclight_vae, _iclight_device
+
+    if _iclight_t2i_pipe is not None:
+        return _iclight_t2i_pipe, _iclight_i2i_pipe, _iclight_vae, _iclight_device
+
+    import safetensors.torch as sf
+    from diffusers import (
+        AutoencoderKL,
+        DPMSolverMultistepScheduler,
+        StableDiffusionImg2ImgPipeline,
+        StableDiffusionPipeline,
+        UNet2DConditionModel,
+    )
+    from diffusers.models.attention_processor import AttnProcessor2_0
+    from transformers import CLIPTextModel, CLIPTokenizer
+
+    _iclight_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sd15_name = "stablediffusionapi/realistic-vision-v51"
+
+    logger.info(f"Loading IC-Light FBC model on {_iclight_device}...")
+
+    # Load SD1.5 components
+    tokenizer = CLIPTokenizer.from_pretrained(sd15_name, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(sd15_name, subfolder="text_encoder")
+    vae = AutoencoderKL.from_pretrained(sd15_name, subfolder="vae")
+    unet = UNet2DConditionModel.from_pretrained(sd15_name, subfolder="unet")
+
+    # Modify UNet conv_in: 4 -> 12 channels (fg latent + bg latent + noise)
+    with torch.no_grad():
+        new_conv_in = torch.nn.Conv2d(
+            12,
+            unet.conv_in.out_channels,
+            unet.conv_in.kernel_size,
+            unet.conv_in.stride,
+            unet.conv_in.padding,
+        )
+        new_conv_in.weight.zero_()
+        new_conv_in.weight[:, :4, :, :].copy_(unet.conv_in.weight)
+        new_conv_in.bias = unet.conv_in.bias
+        unet.conv_in = new_conv_in
+
+    # Hook UNet forward to concatenate condition latents
+    unet_original_forward = unet.forward
+
+    def hooked_unet_forward(
+        sample: Any, timestep: Any, encoder_hidden_states: Any, **kwargs: Any
+    ) -> Any:
+        c_concat = kwargs["cross_attention_kwargs"]["concat_conds"].to(sample)
+        c_concat = torch.cat([c_concat] * (sample.shape[0] // c_concat.shape[0]), dim=0)
+        new_sample = torch.cat([sample, c_concat], dim=1)
+        kwargs["cross_attention_kwargs"] = {}
+        return unet_original_forward(
+            new_sample, timestep, encoder_hidden_states, **kwargs
+        )
+
+    unet.forward = hooked_unet_forward
+
+    # Download and merge IC-Light weights
+    models_dir = Path("models")
+    models_dir.mkdir(exist_ok=True)
+    model_path = models_dir / "iclight_sd15_fbc.safetensors"
+
+    if not model_path.exists():
+        logger.info("Downloading IC-Light FBC weights...")
+        from torch.hub import download_url_to_file
+
+        download_url_to_file(
+            url="https://huggingface.co/lllyasviel/ic-light/resolve/main/iclight_sd15_fbc.safetensors",
+            dst=str(model_path),
+        )
+
+    # Merge IC-Light offset weights into UNet
+    sd_offset = sf.load_file(str(model_path))
+    sd_origin = unet.state_dict()
+    sd_merged = {k: sd_origin[k] + sd_offset[k] for k in sd_origin.keys()}
+    unet.load_state_dict(sd_merged, strict=True)
+    del sd_offset, sd_origin, sd_merged
+
+    # Move to device with float16
+    text_encoder = text_encoder.to(device=_iclight_device, dtype=torch.float16)
+    vae = vae.to(device=_iclight_device, dtype=torch.bfloat16)
+    unet = unet.to(device=_iclight_device, dtype=torch.float16)
+
+    # Use SDP attention
+    unet.set_attn_processor(AttnProcessor2_0())
+    vae.set_attn_processor(AttnProcessor2_0())
+
+    # Create scheduler
+    scheduler = DPMSolverMultistepScheduler(
+        num_train_timesteps=1000,
+        beta_start=0.00085,
+        beta_end=0.012,
+        algorithm_type="sde-dpmsolver++",
+        use_karras_sigmas=True,
+        steps_offset=1,
+    )
+
+    # Create pipelines
+    pipe_kwargs: dict[str, Any] = dict(
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        scheduler=scheduler,
+        safety_checker=None,
+        requires_safety_checker=False,
+        feature_extractor=None,
+        image_encoder=None,
+    )
+
+    _iclight_t2i_pipe = StableDiffusionPipeline(**pipe_kwargs)
+    _iclight_i2i_pipe = StableDiffusionImg2ImgPipeline(**pipe_kwargs)
+    _iclight_vae = vae
+
+    logger.info("IC-Light FBC model loaded successfully")
+    return _iclight_t2i_pipe, _iclight_i2i_pipe, _iclight_vae, _iclight_device
+
+
+# --- Helper functions for IC-Light ---
+
+
+def _numpy2pytorch(imgs: list[np.ndarray]) -> torch.Tensor:
+    """Convert numpy images to pytorch tensor."""
+    h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.0 - 1.0
+    h = h.movedim(-1, 1)
+    return h
+
+
+def _pytorch2numpy(imgs: torch.Tensor, quant: bool = True) -> list[np.ndarray]:
+    """Convert pytorch tensor to numpy images."""
+    results: list[np.ndarray] = []
+    for x in imgs:
+        y = x.movedim(0, -1)
+        if quant:
+            y = y * 127.5 + 127.5
+            y = y.detach().float().cpu().numpy().clip(0, 255).astype(np.uint8)
+        else:
+            y = y * 0.5 + 0.5
+            y = y.detach().float().cpu().numpy().clip(0, 1).astype(np.float32)
+        results.append(y)
+    return results
+
+
+def _resize_and_center_crop(
+    image: np.ndarray, target_width: int, target_height: int
+) -> np.ndarray:
+    """Resize image and center crop to target dimensions."""
+    pil_image = Image.fromarray(image)
+    original_width, original_height = pil_image.size
+    scale_factor = max(target_width / original_width, target_height / original_height)
+    resized_width = int(round(original_width * scale_factor))
+    resized_height = int(round(original_height * scale_factor))
+    resized_image = pil_image.resize(
+        (resized_width, resized_height), Image.Resampling.LANCZOS
+    )
+    left = (resized_width - target_width) / 2
+    top = (resized_height - target_height) / 2
+    right = (resized_width + target_width) / 2
+    bottom = (resized_height + target_height) / 2
+    cropped_image = resized_image.crop((left, top, right, bottom))
+    return np.array(cropped_image)
+
+
+def _resize_without_crop(
+    image: np.ndarray, target_width: int, target_height: int
+) -> np.ndarray:
+    """Resize image without cropping."""
+    pil_image = Image.fromarray(image)
+    resized_image = pil_image.resize(
+        (target_width, target_height), Image.Resampling.LANCZOS
+    )
+    return np.array(resized_image)
+
+
+def _encode_prompt_inner(
+    txt: str, tokenizer: Any, text_encoder: Any, device: Any
+) -> Any:
+    """Encode text prompt to embeddings."""
+    max_length = tokenizer.model_max_length
+    chunk_length = tokenizer.model_max_length - 2
+    id_start = tokenizer.bos_token_id
+    id_end = tokenizer.eos_token_id
+    id_pad = id_end
+
+    def pad(x: list[int], p: int, i: int) -> list[int]:
+        return x[:i] if len(x) >= i else x + [p] * (i - len(x))
+
+    tokens = tokenizer(txt, truncation=False, add_special_tokens=False)["input_ids"]
+    chunks = [
+        [id_start] + tokens[i : i + chunk_length] + [id_end]
+        for i in range(0, len(tokens), chunk_length)
+    ]
+    chunks = [pad(ck, id_pad, max_length) for ck in chunks]
+
+    token_ids = torch.tensor(chunks).to(device=device, dtype=torch.int64)
+    conds = text_encoder(token_ids).last_hidden_state
+    return conds
+
+
+def _encode_prompt_pair(
+    positive: str, negative: str, tokenizer: Any, text_encoder: Any, device: Any
+) -> tuple[Any, Any]:
+    """Encode positive and negative prompts."""
+    c = _encode_prompt_inner(positive, tokenizer, text_encoder, device)
+    uc = _encode_prompt_inner(negative, tokenizer, text_encoder, device)
+
+    c_len = float(len(c))
+    uc_len = float(len(uc))
+    max_count = max(c_len, uc_len)
+    c_repeat = int(math.ceil(max_count / c_len))
+    uc_repeat = int(math.ceil(max_count / uc_len))
+    max_chunk = max(len(c), len(uc))
+
+    c = torch.cat([c] * c_repeat, dim=0)[:max_chunk]
+    uc = torch.cat([uc] * uc_repeat, dim=0)[:max_chunk]
+
+    c = torch.cat([p[None, ...] for p in c], dim=1)
+    uc = torch.cat([p[None, ...] for p in uc], dim=1)
+
+    return c, uc
+
+
+# --- Services ---
+
+
 class BackgroundRemovalService(AIService):
     """
     Background removal service using RMBG-1.4.
 
-    Strategy: Local model first → API fallback
-    - Tries local GPU inference first (RMBG-1.4)
-    - Falls back to API if local processing fails
+    Strategy: Local model first -> API fallback
     """
 
     api_url: Optional[str] = None
@@ -102,27 +340,16 @@ class BackgroundRemovalService(AIService):
             self.api_url = settings.rmbg_api_url
 
     async def process(self, image_path: str, **kwargs: str) -> str:
-        """
-        Remove background from an image.
-
-        Strategy: Local first → API fallback
-
-        Args:
-            image_path: Path to the input image.
-
-        Returns:
-            Path to the image with background removed (PNG with transparency).
-        """
-        # Try local model first
+        """Remove background from an image. Local first, API fallback."""
         if self.use_local_model:
             try:
                 return await self._process_local_model(image_path)
             except Exception as e:
                 import traceback
+
                 logger.warning(f"Local RMBG model failed: {e}")
                 logger.warning(f"Full traceback:\n{traceback.format_exc()}")
 
-        # Fallback to API
         if self.api_url:
             try:
                 return await self._process_api(image_path)
@@ -130,46 +357,34 @@ class BackgroundRemovalService(AIService):
                 logger.error(f"API fallback also failed: {e}")
                 raise AIServiceError(f"Background removal failed: {e}") from e
 
-        # Last resort: simple placeholder processing
         logger.warning("No API configured, using placeholder processing")
         return await self._process_placeholder(image_path)
 
     async def _process_local_model(self, image_path: str) -> str:
-        """
-        Process using local RMBG-1.4 model on GPU.
-
-        Uses IS-Net architecture with 1024x1024 input size.
-        """
-        # Load model (lazy loading)
+        """Process using local RMBG-1.4 model on GPU."""
         model, device = _load_rmbg_model()
 
-        # Read image
         orig_im = skimage_io.imread(image_path)
         orig_im_size = orig_im.shape[0:2]
         model_input_size = [1024, 1024]
 
-        # Preprocess
         image_tensor = self._preprocess_image(orig_im, model_input_size)
         image_tensor = image_tensor.to(device)
 
-        # Inference
         with torch.no_grad():
             result = model(image_tensor)
 
-        # Postprocess
         mask = self._postprocess_mask(result[0][0], orig_im_size)
 
-        # Apply mask to original image
         output_path = Path(image_path).parent / "bg_removed.png"
         pil_mask = Image.fromarray(mask)
         orig_image = Image.open(image_path).convert("RGBA")
 
-        # Create transparent image
         no_bg_image = orig_image.copy()
         no_bg_image.putalpha(pil_mask)
         no_bg_image.save(output_path, "PNG")
 
-        logger.info(f"Background removed successfully using local model: {output_path}")
+        logger.info(f"Background removed via local model: {output_path}")
         return str(output_path)
 
     def _preprocess_image(
@@ -180,12 +395,9 @@ class BackgroundRemovalService(AIService):
         """Preprocess image for RMBG-1.4 model."""
         if len(im.shape) < 3:
             im = im[:, :, np.newaxis]
-
         im_tensor = torch.tensor(im, dtype=torch.float32).permute(2, 0, 1)
         im_tensor = F.interpolate(
-            torch.unsqueeze(im_tensor, 0),
-            size=model_input_size,
-            mode='bilinear'
+            torch.unsqueeze(im_tensor, 0), size=model_input_size, mode="bilinear"
         )
         image = torch.divide(im_tensor, 255.0)
         image = normalize(image, [0.5, 0.5, 0.5], [1.0, 1.0, 1.0])
@@ -197,21 +409,15 @@ class BackgroundRemovalService(AIService):
         im_size: tuple[int, int],
     ) -> np.ndarray:
         """Postprocess model output to get mask."""
-        # result shape is [C, H, W] = [1, 1024, 1024]
-        # F.interpolate needs [N, C, H, W]
         if result.dim() == 3:
-            result = result.unsqueeze(0)  # [1, 1, 1024, 1024]
-
-        # Resize to original image size
-        result = F.interpolate(result, size=im_size, mode='bilinear', align_corners=False)
-
-        # Normalize to 0-255
-        result = result.squeeze()  # Remove batch and channel dims -> [H, W]
+            result = result.unsqueeze(0)
+        result = F.interpolate(
+            result, size=im_size, mode="bilinear", align_corners=False
+        )
+        result = result.squeeze()
         ma = torch.max(result)
         mi = torch.min(result)
         result = (result - mi) / (ma - mi)
-
-        # Convert to numpy uint8
         im_array = (result * 255).cpu().data.numpy().astype(np.uint8)
         return np.asarray(im_array)
 
@@ -220,52 +426,39 @@ class BackgroundRemovalService(AIService):
         async with httpx.AsyncClient(timeout=120.0) as client:
             with open(image_path, "rb") as f:
                 image_data = f.read()
-
-            # Encode image as base64 for API
             image_b64 = base64.b64encode(image_data).decode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            settings = get_settings()
+            if settings.rmbg_api_key:
+                headers["Authorization"] = f"Bearer {settings.rmbg_api_key}"
 
             response = await client.post(
                 self.api_url,  # type: ignore[arg-type]
                 json={"image": image_b64},
-                headers={"Content-Type": "application/json"},
+                headers=headers,
             )
-
             if response.status_code != 200:
                 raise AIServiceError(
                     f"RMBG API error: {response.status_code} - {response.text}"
                 )
-
             result = response.json()
-            result_image_b64 = result.get("result", result.get("image", ""))
-
-            # Save result
+            result_b64 = result.get("result", result.get("image", ""))
             output_path = Path(image_path).parent / "bg_removed.png"
-            image_bytes = base64.b64decode(result_image_b64)
             with open(output_path, "wb") as f:
-                f.write(image_bytes)
-
+                f.write(base64.b64decode(result_b64))
             return str(output_path)
 
     async def _process_placeholder(self, image_path: str) -> str:
-        """
-        Placeholder processing for testing when no model/API available.
-        Simply converts image to RGBA.
-        """
+        """Placeholder: simply converts image to RGBA."""
         output_path = Path(image_path).parent / "bg_removed.png"
-
         img = Image.open(image_path)
         output_img = img.convert("RGBA") if img.mode != "RGBA" else img
         output_img.save(output_path, "PNG")
-
         return str(output_path)
 
 
 class SceneGenerationService(AIService):
-    """
-    Scene generation service using Flux or SDXL.
-
-    Generates new backgrounds/scenes based on text prompts.
-    """
+    """Scene generation service using Flux or SDXL."""
 
     api_url: Optional[str] = None
 
@@ -276,21 +469,12 @@ class SceneGenerationService(AIService):
             self.api_url = settings.flux_api_url
 
     async def process(self, image_path: str, **kwargs: str) -> str:
-        """
-        Generate a scene based on the input image and prompt.
-
-        Args:
-            image_path: Path to the foreground image (with transparent background).
-            prompt: Text prompt describing the desired scene.
-
-        Returns:
-            Path to the generated scene image.
-        """
-        prompt = kwargs.get("prompt", "professional product photography, studio lighting")
-
+        """Generate a scene based on the input image and prompt."""
+        prompt = kwargs.get(
+            "prompt", "professional product photography, studio lighting"
+        )
         if not self.api_url:
             return await self._process_local(image_path, prompt)
-
         return await self._process_api(image_path, prompt)
 
     async def _process_api(self, image_path: str, prompt: str) -> str:
@@ -298,9 +482,7 @@ class SceneGenerationService(AIService):
         async with httpx.AsyncClient(timeout=180.0) as client:
             with open(image_path, "rb") as f:
                 image_data = f.read()
-
             image_b64 = base64.b64encode(image_data).decode("utf-8")
-
             payload = {
                 "image": image_b64,
                 "prompt": prompt,
@@ -308,51 +490,48 @@ class SceneGenerationService(AIService):
                 "num_inference_steps": 30,
                 "guidance_scale": 7.5,
             }
+            headers = {"Content-Type": "application/json"}
+            settings = get_settings()
+            if settings.flux_api_key:
+                # Replicate uses "Token <key>"
+                if "replicate.com" in str(self.api_url):
+                    headers["Authorization"] = f"Token {settings.flux_api_key}"
+                else:
+                    headers["Authorization"] = f"Bearer {settings.flux_api_key}"
 
             response = await client.post(
                 self.api_url,  # type: ignore[arg-type]
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
             )
-
             if response.status_code != 200:
                 raise AIServiceError(
-                    f"Scene generation API error: {response.status_code} - {response.text}"
+                    f"Scene API error: {response.status_code} - {response.text}"
                 )
-
             result = response.json()
-            result_image_b64 = result.get("result", result.get("image", ""))
-
+            result_b64 = result.get("result", result.get("image", ""))
             output_path = Path(image_path).parent / "scene.png"
-            image_bytes = base64.b64decode(result_image_b64)
             with open(output_path, "wb") as f:
-                f.write(image_bytes)
-
+                f.write(base64.b64decode(result_b64))
             return str(output_path)
 
     async def _process_local(self, image_path: str, prompt: str) -> str:
-        """
-        Local processing placeholder.
-
-        In production, this would use Flux/SDXL model directly.
-        """
+        """Local processing placeholder."""
         output_path = Path(image_path).parent / "scene.png"
-
-        # Create a simple gradient background for testing
         img = Image.new("RGB", (1024, 1024), color=(240, 240, 245))
         img.save(output_path, "PNG")
-
         return str(output_path)
 
 
 class RelightingService(AIService):
     """
-    Relighting service using IC-Light.
+    Relighting service using IC-Light FBC model.
 
-    IC-Light harmonizes lighting between foreground and background.
+    Strategy: Local model first -> API fallback
     """
 
     api_url: Optional[str] = None
+    use_local_model: bool = True
 
     def model_post_init(self, __context: object) -> None:
         """Initialize API URL from settings if not provided."""
@@ -362,21 +541,159 @@ class RelightingService(AIService):
 
     async def process(self, image_path: str, **kwargs: str) -> str:
         """
-        Apply relighting to composite foreground and background.
+        Apply relighting. Local first, API fallback.
 
         Args:
-            image_path: Path to the foreground image.
-            background_path: Path to the background/scene image.
-
-        Returns:
-            Path to the final composited image with harmonized lighting.
+            image_path: Path to the foreground image (RGBA).
+            background_path: Path to the background image.
+            prompt: Text description of desired lighting.
         """
         background_path = kwargs.get("background_path", "")
+        prompt = kwargs.get(
+            "prompt", "professional product photography, studio lighting"
+        )
 
-        if not self.api_url:
-            return await self._process_local(image_path, background_path)
+        if self.use_local_model:
+            try:
+                return await self._process_local_model(
+                    image_path, background_path, prompt
+                )
+            except Exception as e:
+                import traceback
 
-        return await self._process_api(image_path, background_path)
+                logger.warning(f"Local IC-Light model failed: {e}")
+                logger.warning(f"Full traceback:\n{traceback.format_exc()}")
+
+        if self.api_url:
+            try:
+                return await self._process_api(image_path, background_path)
+            except Exception as e:
+                logger.error(f"IC-Light API fallback failed: {e}")
+                raise AIServiceError(f"Relighting failed: {e}") from e
+
+        logger.warning("No API configured, using placeholder compositing")
+        return await self._process_placeholder(image_path, background_path)
+
+    @torch.inference_mode()
+    async def _process_local_model(
+        self, fg_path: str, bg_path: str, prompt: str
+    ) -> str:
+        """
+        Process using local IC-Light FBC model on GPU.
+
+        Pipeline: encode fg+bg -> txt2img -> highres img2img -> decode
+        """
+        t2i_pipe, i2i_pipe, vae, device = _load_iclight_model()
+
+        # Parameters
+        image_width, image_height = 512, 512
+        steps, cfg = 25, 2.0
+        highres_scale, highres_denoise = 1.5, 0.5
+        seed = 12345
+        a_prompt = "best quality, high detail"
+        n_prompt = "lowres, bad anatomy, bad hands, cropped, worst quality"
+
+        rng = torch.Generator(device=device).manual_seed(seed)
+
+        # Load and resize images
+        fg_img = np.array(Image.open(fg_path).convert("RGB"))
+        fg = _resize_and_center_crop(fg_img, image_width, image_height)
+
+        if bg_path and Path(bg_path).exists():
+            bg_img = np.array(Image.open(bg_path).convert("RGB"))
+            bg = _resize_and_center_crop(bg_img, image_width, image_height)
+        else:
+            bg = np.zeros((image_height, image_width, 3), dtype=np.uint8) + 64
+            bg_img = bg
+
+        # Encode fg+bg through VAE
+        concat_conds = _numpy2pytorch([fg, bg]).to(device=vae.device, dtype=vae.dtype)
+        concat_conds = (
+            vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
+        )
+        concat_conds = torch.cat([c[None, ...] for c in concat_conds], dim=1)
+
+        # Encode prompts
+        tokenizer = t2i_pipe.tokenizer
+        text_encoder = t2i_pipe.text_encoder
+        conds, unconds = _encode_prompt_pair(
+            prompt + ", " + a_prompt,
+            n_prompt,
+            tokenizer,
+            text_encoder,
+            device,
+        )
+
+        # First pass: txt2img
+        latents = (
+            t2i_pipe(
+                prompt_embeds=conds,
+                negative_prompt_embeds=unconds,
+                width=image_width,
+                height=image_height,
+                num_inference_steps=steps,
+                num_images_per_prompt=1,
+                generator=rng,
+                output_type="latent",
+                guidance_scale=cfg,
+                cross_attention_kwargs={"concat_conds": concat_conds},
+            ).images.to(vae.dtype)
+            / vae.config.scaling_factor
+        )
+
+        # Decode first pass
+        pixels = vae.decode(latents).sample
+        pixels_np = _pytorch2numpy(pixels)
+
+        # Highres upscale
+        hr_w = int(round(image_width * highres_scale / 64.0) * 64)
+        hr_h = int(round(image_height * highres_scale / 64.0) * 64)
+        pixels_np = [_resize_without_crop(p, hr_w, hr_h) for p in pixels_np]
+
+        pixels_t = _numpy2pytorch(pixels_np).to(device=vae.device, dtype=vae.dtype)
+        latents = vae.encode(pixels_t).latent_dist.mode() * vae.config.scaling_factor
+        latents = latents.to(device=device, dtype=torch.float16)
+
+        # Recalculate hr dimensions and re-encode conditions
+        hr_height = latents.shape[2] * 8
+        hr_width = latents.shape[3] * 8
+        fg_hr = _resize_and_center_crop(fg_img, hr_width, hr_height)
+        bg_hr = _resize_and_center_crop(bg_img, hr_width, hr_height)
+        concat_hr = _numpy2pytorch([fg_hr, bg_hr]).to(
+            device=vae.device, dtype=vae.dtype
+        )
+        concat_hr = vae.encode(concat_hr).latent_dist.mode() * vae.config.scaling_factor
+        concat_hr = torch.cat([c[None, ...] for c in concat_hr], dim=1)
+
+        # Second pass: img2img highres
+        latents = (
+            i2i_pipe(
+                image=latents,
+                strength=highres_denoise,
+                prompt_embeds=conds,
+                negative_prompt_embeds=unconds,
+                width=hr_width,
+                height=hr_height,
+                num_inference_steps=int(round(steps / highres_denoise)),
+                num_images_per_prompt=1,
+                generator=rng,
+                output_type="latent",
+                guidance_scale=cfg,
+                cross_attention_kwargs={"concat_conds": concat_hr},
+            ).images.to(vae.dtype)
+            / vae.config.scaling_factor
+        )
+
+        # Final decode
+        pixels = vae.decode(latents).sample
+        final_np = _pytorch2numpy(pixels)
+
+        # Save result
+        output_path = Path(fg_path).parent / "relit.png"
+        Image.fromarray(final_np[0]).save(output_path, "PNG")
+
+        logger.info(f"Relighting completed via local IC-Light: {output_path}")
+        return str(output_path)
 
     async def _process_api(self, fg_path: str, bg_path: str) -> str:
         """Process using remote IC-Light API."""
@@ -385,57 +702,44 @@ class RelightingService(AIService):
                 fg_data = base64.b64encode(f.read()).decode("utf-8")
             with open(bg_path, "rb") as f:
                 bg_data = base64.b64encode(f.read()).decode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            settings = get_settings()
+            if settings.iclight_api_key:
+                headers["Authorization"] = f"Bearer {settings.iclight_api_key}"
 
             payload = {
                 "foreground": fg_data,
                 "background": bg_data,
                 "lighting_mode": "auto",
             }
-
             response = await client.post(
                 self.api_url,  # type: ignore[arg-type]
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
             )
-
             if response.status_code != 200:
                 raise AIServiceError(
                     f"IC-Light API error: {response.status_code} - {response.text}"
                 )
-
             result = response.json()
-            result_image_b64 = result.get("result", result.get("image", ""))
-
-            output_path = Path(fg_path).parent / "final.png"
-            image_bytes = base64.b64decode(result_image_b64)
+            result_b64 = result.get("result", result.get("image", ""))
+            output_path = Path(fg_path).parent / "relit.png"
             with open(output_path, "wb") as f:
-                f.write(image_bytes)
-
+                f.write(base64.b64decode(result_b64))
             return str(output_path)
 
-    async def _process_local(self, fg_path: str, bg_path: str) -> str:
-        """
-        Local processing placeholder.
-
-        In production, this would use IC-Light model directly.
-        For now, this does a simple composite.
-        """
-        output_path = Path(fg_path).parent / "final.png"
-
-        # Simple composite for testing
+    async def _process_placeholder(self, fg_path: str, bg_path: str) -> str:
+        """Simple composite placeholder."""
+        output_path = Path(fg_path).parent / "relit.png"
         fg_img = Image.open(fg_path)
         if bg_path and Path(bg_path).exists():
-            bg_img = Image.open(bg_path)
-            resized_bg = bg_img.resize(fg_img.size)
-
+            bg_img = Image.open(bg_path).resize(fg_img.size)
             if fg_img.mode == "RGBA":
-                bg_rgba = resized_bg.convert("RGBA")
-                result = Image.alpha_composite(bg_rgba, fg_img)
+                result = Image.alpha_composite(bg_img.convert("RGBA"), fg_img)
             else:
                 result = fg_img
         else:
             result = fg_img
-
         result.save(output_path, "PNG")
         return str(output_path)
 
@@ -444,7 +748,9 @@ class AIServiceFactory:
     """Factory for creating AI service instances."""
 
     @staticmethod
-    def get_background_removal_service(use_local: bool = True) -> BackgroundRemovalService:
+    def get_background_removal_service(
+        use_local: bool = True,
+    ) -> BackgroundRemovalService:
         """Get background removal service instance."""
         return BackgroundRemovalService(use_local_model=use_local)
 
@@ -454,6 +760,6 @@ class AIServiceFactory:
         return SceneGenerationService()
 
     @staticmethod
-    def get_relighting_service() -> RelightingService:
+    def get_relighting_service(use_local: bool = True) -> RelightingService:
         """Get relighting service instance."""
-        return RelightingService()
+        return RelightingService(use_local_model=use_local)

@@ -1,6 +1,7 @@
-from enum import Enum
 from datetime import datetime
+from enum import Enum
 from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -18,9 +19,7 @@ class TaskStatus(str, Enum):
 class TaskCreate(BaseModel):
     """Schema for creating a new task."""
 
-    scene_prompt: Optional[str] = Field(
-        None, description="Prompt for scene generation"
-    )
+    scene_prompt: Optional[str] = Field(None, description="Prompt for scene generation")
 
 
 class TaskResponse(BaseModel):

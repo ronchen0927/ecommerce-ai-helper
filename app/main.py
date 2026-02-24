@@ -1,4 +1,5 @@
 """FastAPI application factory and configuration."""
+
 import logging
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -54,8 +55,7 @@ def create_app() -> FastAPI:
     # Authentication and rate limiting middleware
     @app.middleware("http")
     async def auth_middleware(
-        request: Request,
-        call_next: Callable[[Request], Awaitable[Response]]
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         """Middleware for authentication and rate limiting."""
         # Skip auth for health check and docs
@@ -86,6 +86,7 @@ def create_app() -> FastAPI:
         except Exception as e:
             # Re-raise HTTPExceptions (they have proper status codes)
             from fastapi import HTTPException
+
             if isinstance(e, HTTPException):
                 raise
             # Log and re-raise other exceptions

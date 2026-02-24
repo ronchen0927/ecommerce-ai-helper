@@ -73,8 +73,8 @@ class TestRelightingService:
 
     @pytest.fixture
     def service(self) -> RelightingService:
-        """Create service instance without API URL (local mode)."""
-        return RelightingService(api_url=None)
+        """Create service instance without API URL (placeholder mode)."""
+        return RelightingService(api_url=None, use_local_model=False)
 
     @pytest.fixture
     def sample_images(self, tmp_path: Path) -> tuple[str, str]:
@@ -94,18 +94,18 @@ class TestRelightingService:
     async def test_local_processing(
         self, service: RelightingService, sample_images: tuple[str, str]
     ) -> None:
-        """Test local relighting creates composited output."""
+        """Test relighting creates composited output."""
         fg_path, bg_path = sample_images
         result = await service.process(fg_path, background_path=bg_path)
 
         assert Path(result).exists()
-        assert result.endswith("final.png")
+        assert result.endswith("relit.png")
 
     @pytest.mark.asyncio
     async def test_local_processing_no_background(
         self, service: RelightingService, sample_images: tuple[str, str]
     ) -> None:
-        """Test local relighting without background."""
+        """Test relighting without background."""
         fg_path, _ = sample_images
         result = await service.process(fg_path, background_path="")
 

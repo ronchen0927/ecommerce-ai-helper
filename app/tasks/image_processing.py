@@ -7,6 +7,7 @@ the three-stage AI pipeline:
 2. Scene Generation (Flux/SDXL)
 3. Relighting (IC-Light)
 """
+
 import asyncio
 from pathlib import Path
 from typing import Any, Coroutine, Optional, TypeVar
@@ -16,7 +17,6 @@ from celery import Task
 from app.core.celery_app import celery_app
 from app.schemas.task import TaskStatus
 from app.services.ai_service import AIServiceFactory
-
 
 T = TypeVar("T")
 

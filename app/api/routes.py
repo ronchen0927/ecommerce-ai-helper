@@ -1,4 +1,5 @@
 """API routes for image processing tasks."""
+
 import os
 import tempfile
 import uuid

@@ -20,6 +20,9 @@ dependencies = [
     "scikit-image>=0.22.0",
     "numpy>=1.26.0",
     "python-jose[cryptography]>=3.5.0",
+    "diffusers>=0.27.0",
+    "safetensors>=0.4.0",
+    "accelerate>=0.27.0",
 ]
 
 [tool.uv]
@@ -29,6 +32,15 @@ dev-dependencies = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
 
 [build-system]
 requires = ["hatchling"]
@@ -41,8 +53,11 @@ packages = ["app"]
 line-length = 88
 target-version = "py312"
 
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
-disable_error_code = ["untyped-decorator"]
+disable_error_code = ["untyped-decorator", "no-untyped-call"]

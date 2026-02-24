@@ -1,4 +1,5 @@
 """Storage service interfaces and implementations."""
+
 import shutil
 from datetime import timedelta
 from pathlib import Path
@@ -137,8 +138,7 @@ class GCSStorage(StorageService):
                 self.credentials_path
             )
             self._client = storage.Client(
-                project=self.project_id,
-                credentials=credentials
+                project=self.project_id, credentials=credentials
             )
         else:
             # Use default credentials (e.g., from GOOGLE_APPLICATION_CREDENTIALS)
@@ -164,10 +164,7 @@ class GCSStorage(StorageService):
         return f"https://storage.googleapis.com/{self.bucket_name}/{path}"
 
     def get_signed_url(
-        self,
-        path: str,
-        expiration_minutes: int = 60,
-        method: str = "GET"
+        self, path: str, expiration_minutes: int = 60, method: str = "GET"
     ) -> str:
         """
         Generate a signed URL for temporary access.

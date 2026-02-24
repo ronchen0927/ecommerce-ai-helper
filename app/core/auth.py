@@ -1,4 +1,5 @@
 """Authentication and authorization module."""
+
 import hashlib
 import secrets
 import time
@@ -33,10 +34,7 @@ class RateLimiter:
         self._requests: dict[str, list[float]] = defaultdict(list)
 
     def is_allowed(
-        self,
-        key: str,
-        max_requests: int,
-        window_seconds: int
+        self, key: str, max_requests: int, window_seconds: int
     ) -> tuple[bool, int]:
         """
         Check if request is allowed under rate limit.
@@ -53,10 +51,7 @@ class RateLimiter:
         window_start = now - window_seconds
 
         # Clean old requests
-        self._requests[key] = [
-            ts for ts in self._requests[key]
-            if ts > window_start
-        ]
+        self._requests[key] = [ts for ts in self._requests[key] if ts > window_start]
 
         current_count = len(self._requests[key])
 
@@ -143,7 +138,13 @@ async def check_rate_limit(request: Request, api_key: str) -> None:
         return
 
     # Use API key or IP as rate limit key
-    rate_key = api_key if api_key != "anonymous" else request.client.host if request.client else "unknown"
+    rate_key = (
+        api_key
+        if api_key != "anonymous"
+        else request.client.host
+        if request.client
+        else "unknown"
+    )
 
     is_allowed, remaining = rate_limiter.is_allowed(
         rate_key,
@@ -153,8 +154,7 @@ async def check_rate_limit(request: Request, api_key: str) -> None:
 
     if not is_allowed:
         reset_time = rate_limiter.get_reset_time(
-            rate_key,
-            settings.rate_limit_window_seconds
+            rate_key, settings.rate_limit_window_seconds
         )
         raise HTTPException(
             status_code=429,
@@ -199,11 +199,13 @@ def create_jwt_token(
         "iat": int(time.time()),
     }
 
-    return str(jwt.encode(
-        payload,
-        settings.jwt_secret_key,
-        algorithm=settings.jwt_algorithm,
-    ))
+    return str(
+        jwt.encode(
+            payload,
+            settings.jwt_secret_key,
+            algorithm=settings.jwt_algorithm,
+        )
+    )
 
 
 def verify_jwt_token(token: str) -> TokenData:
@@ -253,6 +255,7 @@ def require_scopes(*required_scopes: str) -> Callable[..., Any]:
         async def admin_endpoint():
             ...
     """
+
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -286,5 +289,7 @@ def require_scopes(*required_scopes: str) -> Callable[..., Any]:
                     )
 
             return await func(*args, **kwargs)
+
         return wrapper
+
     return decorator
