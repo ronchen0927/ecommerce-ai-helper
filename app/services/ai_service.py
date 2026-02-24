@@ -183,9 +183,9 @@ def _load_iclight_model() -> tuple[Any, Any, Any, Any]:
     unet.load_state_dict(sd_merged, strict=True)
     del sd_offset, sd_origin, sd_merged
 
-    # Move to device with float16 (VAE on float32 for stability)
+    # Move to device with float16
     text_encoder = text_encoder.to(device=_iclight_device, dtype=torch.float16)
-    vae = vae.to(device=_iclight_device, dtype=torch.float32)
+    vae = vae.to(device=_iclight_device, dtype=torch.float16)
     unet = unet.to(device=_iclight_device, dtype=torch.float16)
 
     # Use SDP attention
@@ -222,6 +222,8 @@ def _load_iclight_model() -> tuple[Any, Any, Any, Any]:
     # Optimize for VRAM
     _iclight_t2i_pipe.enable_attention_slicing()
     _iclight_i2i_pipe.enable_attention_slicing()
+    _iclight_vae.enable_slicing()
+    _iclight_vae.enable_tiling()
 
     logger.info("IC-Light FBC model loaded successfully")
     return _iclight_t2i_pipe, _iclight_i2i_pipe, _iclight_vae, _iclight_device
@@ -652,6 +654,8 @@ class RelightingService(AIService):
             / vae.config.scaling_factor
         )
 
+        torch.cuda.empty_cache()
+
         # Decode first pass
         pixels = vae.decode(latents).sample
         pixels_np = _pytorch2numpy(pixels)
@@ -660,6 +664,8 @@ class RelightingService(AIService):
         hr_w = int(round(image_width * highres_scale / 64.0) * 64)
         hr_h = int(round(image_height * highres_scale / 64.0) * 64)
         pixels_np = [_resize_without_crop(p, hr_w, hr_h) for p in pixels_np]
+
+        torch.cuda.empty_cache()
 
         # Use PIL image for img2img to avoid range issues and ensure optimization
         hr_pil = Image.fromarray(pixels_np[0])
