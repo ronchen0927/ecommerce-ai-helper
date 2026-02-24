@@ -374,6 +374,7 @@ dependencies = [
     { name = "flower" },
     { name = "google-cloud-storage" },
     { name = "httpx" },
+    { name = "huggingface-hub", extra = ["hf-xet"] },
     { name = "numpy" },
     { name = "pillow" },
     { name = "pydantic-settings" },
@@ -405,6 +406,7 @@ requires-dist = [
     { name = "flower", specifier = ">=2.0.1" },
     { name = "google-cloud-storage", specifier = ">=2.14.0" },
     { name = "httpx", specifier = ">=0.26.0" },
+    { name = "huggingface-hub", extras = ["hf-xet"], specifier = ">=0.36.2" },
     { name = "numpy", specifier = ">=1.26.0" },
     { name = "pillow", specifier = ">=10.2.0" },
     { name = "pydantic-settings", specifier = ">=2.1.0" },
@@ -667,6 +669,11 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/7c/b7/8cb61d2eece5fb05a83271da168186721c450eb74e3c31f7ef3169fa475b/huggingface_hub-0.36.2.tar.gz", hash = "sha256:1934304d2fb224f8afa3b87007d58501acfda9215b334eed53072dd5e815ff7a", size = 649782 }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a8/af/48ac8483240de756d2438c380746e7130d1c6f75802ef22f3c6d49982787/huggingface_hub-0.36.2-py3-none-any.whl", hash = "sha256:48f0c8eac16145dfce371e9d2d7772854a4f591bcb56c9cf548accf531d54270", size = 566395 },
+]
+
+[package.optional-dependencies]
+hf-xet = [
+    { name = "hf-xet" },
 ]
 
 [[package]]

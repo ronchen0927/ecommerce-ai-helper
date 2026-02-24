@@ -24,6 +24,7 @@ dependencies = [
     "safetensors>=0.4.0",
     "accelerate>=0.27.0",
     "flower>=2.0.1",
+    "huggingface-hub[hf-xet]>=0.36.2",
 ]
 
 [tool.uv]
