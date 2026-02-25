@@ -9,7 +9,6 @@ the three-stage AI pipeline:
 """
 
 import asyncio
-import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -18,10 +17,10 @@ from typing import Any, Coroutine, Optional, TypeVar
 from celery import Task
 
 from app.core.celery_app import celery_app
+from app.core.config import get_settings
 from app.schemas.task import TaskStatus
 from app.services.ai_service import AIServiceFactory
-from app.services.storage import GCSStorage, LocalStorage, StorageService
-from app.core.config import get_settings
+from app.services.storage import GCSStorage, LocalStorage
 
 T = TypeVar("T")
 
@@ -56,6 +55,7 @@ def process_image(
     image_path: str,
     scene_prompt: Optional[str] = None,
     negative_prompt: Optional[str] = None,
+    background_color: Optional[str] = None,
 ) -> dict[str, str]:
     """
     Main image processing pipeline (Hybrid GCS/Local Support).
@@ -70,11 +70,11 @@ def process_image(
     # Create a local temporary directory for this task
     temp_dir = Path(tempfile.mkdtemp(prefix=f"task_{task_id}_"))
     local_input_path = temp_dir / Path(image_path).name
-    
+
     try:
         # 1. Download source image if it's remote or just copy it to temp
         if image_path.startswith("gs://") or image_path.startswith("http"):
-            # If it's gs://, image_path is just the key for GCSStorage? 
+            # If it's gs://, image_path is just the key for GCSStorage?
             # Or is it the full URL? Routes.py passes 'stored_path'.
             # For GCS, upload returns 'gs://...'. Let's handle it.
             gcs_key = image_path.replace(f"gs://{settings.gcs_bucket_name}/", "")
@@ -91,14 +91,26 @@ def process_image(
         # Stage 2: Scene Generation
         self.update_task_status(task_id, TaskStatus.GENERATING_SCENE)
         scene_service = AIServiceFactory.get_scene_generation_service()
-        prompt = scene_prompt or "top-down view, flat lay photography, product placed exactly on the surface, professional product photography, studio lighting, contact shadow"
-        local_scene = run_async(scene_service.process(local_bg_removed, prompt=prompt, negative_prompt=negative_prompt))
+        prompt = scene_prompt or ""
+        local_scene = run_async(
+            scene_service.process(
+                local_bg_removed,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                background_color=background_color,
+            )
+        )
 
         # Stage 3: Relighting
         self.update_task_status(task_id, TaskStatus.RELIGHTING)
         relight_service = AIServiceFactory.get_relighting_service()
         local_final = run_async(
-            relight_service.process(local_bg_removed, background_path=local_scene, prompt=prompt, negative_prompt=negative_prompt)
+            relight_service.process(
+                local_bg_removed,
+                background_path=local_scene,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+            )
         )
 
         # 4. Upload final result back to storage
@@ -116,6 +128,7 @@ def process_image(
 
     except Exception as e:
         import traceback
+
         error_msg = f"{str(e)}\n{traceback.format_exc()}"
         self.update_task_status(task_id, TaskStatus.FAILED)
         return {

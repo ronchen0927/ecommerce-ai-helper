@@ -20,7 +20,12 @@ class TaskCreate(BaseModel):
     """Schema for creating a new task."""
 
     scene_prompt: Optional[str] = Field(None, description="Prompt for scene generation")
-    negative_prompt: Optional[str] = Field(None, description="Negative prompt to exclude elements")
+    negative_prompt: Optional[str] = Field(
+        None, description="Negative prompt to exclude elements"
+    )
+    background_color: Optional[str] = Field(
+        None, description="Hex color code for solid background (e.g. #FFFFFF)"
+    )
 
 
 class TaskResponse(BaseModel):

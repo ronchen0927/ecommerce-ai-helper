@@ -95,34 +95,6 @@ def _load_rmbg_model() -> tuple[Any, Any]:
     return _rmbg_model, _torch_device
 
 
-def _load_scene_model() -> tuple[Any, Any]:
-    """
-    Lazy load SD 1.5 for local scene generation.
-    """
-    global _scene_pipe, _scene_device
-
-    if _scene_pipe is not None:
-        return _scene_pipe, _scene_device
-
-    from diffusers import StableDiffusionPipeline
-    import torch
-
-    _scene_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Loading Local Scene Gen Model (SD 1.5) on {_scene_device}...")
-
-    _scene_pipe = StableDiffusionPipeline.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
-        torch_dtype=torch.float16,
-        safety_checker=None,
-    )
-    
-    # Memory optimization
-    _scene_pipe.enable_attention_slicing()
-
-    logger.info("Local Scene Gen Model loaded successfully")
-    return _scene_pipe, _scene_device
-
-
 def _load_iclight_model() -> tuple[Any, Any, Any, Any]:
     """
     Lazy load IC-Light FBC model pipeline.
@@ -248,7 +220,9 @@ def _load_iclight_model() -> tuple[Any, Any, Any, Any]:
     )
 
     _iclight_t2i_pipe = StableDiffusionPipeline(**pipe_kwargs).to(_iclight_device)
-    _iclight_i2i_pipe = StableDiffusionImg2ImgPipeline(**pipe_kwargs).to(_iclight_device)
+    _iclight_i2i_pipe = StableDiffusionImg2ImgPipeline(**pipe_kwargs).to(
+        _iclight_device
+    )
     _iclight_vae = vae
 
     # Optimize for VRAM
@@ -307,25 +281,28 @@ def _resize_and_center_crop(
 
 
 def _resize_and_pad(
-    image: np.ndarray, target_width: int, target_height: int, pad_color: tuple = (127, 127, 127)
+    image: np.ndarray,
+    target_width: int,
+    target_height: int,
+    pad_color: tuple = (127, 127, 127),
 ) -> np.ndarray:
     """Resize image preserving aspect ratio and pad to target dimensions."""
     pil_image = Image.fromarray(image)
     original_width, original_height = pil_image.size
-    
+
     scale_factor = min(target_width / original_width, target_height / original_height)
     resized_width = int(round(original_width * scale_factor))
     resized_height = int(round(original_height * scale_factor))
-    
+
     resized_image = pil_image.resize(
         (resized_width, resized_height), Image.Resampling.LANCZOS
     )
-    
+
     new_image = Image.new("RGB", (target_width, target_height), pad_color)
     paste_x = (target_width - resized_width) // 2
     paste_y = (target_height - resized_height) // 2
     new_image.paste(resized_image, (paste_x, paste_y))
-    
+
     return np.array(new_image)
 
 
@@ -538,22 +515,35 @@ class SceneGenerationService(AIService):
 
     async def process(self, image_path: str, **kwargs: str) -> str:
         """Generate a scene based on the input image and prompt."""
-        prompt = kwargs.get(
-            "prompt", "professional product photography, studio lighting"
-        )
+        prompt = kwargs.get("prompt", "")
         negative_prompt = kwargs.get("negative_prompt")
-        if not self.api_url:
-            return await self._process_local(image_path, prompt, negative_prompt)
-        return await self._process_api(image_path, prompt, negative_prompt)
+        background_color = kwargs.get("background_color")
 
-    async def _process_api(self, image_path: str, prompt: str, negative_prompt: Optional[str] = None) -> str:
+        # 1. User wants a specific solid color background
+        if background_color:
+            return self._process_solid_color(image_path, background_color)
+
+        # 2. User has API configured and wants an AI-generated scene
+        if self.api_url and prompt:
+            return await self._process_api(image_path, prompt, negative_prompt)
+
+        # 3. Fallback: No API and no specific color requested -> default neutral gray
+        return self._process_solid_color(image_path, "#808080")
+
+    async def _process_api(
+        self, image_path: str, prompt: str, negative_prompt: Optional[str] = None
+    ) -> str:
         """Process using remote API (Flux/SDXL)."""
         async with httpx.AsyncClient(timeout=180.0) as client:
             with open(image_path, "rb") as f:
                 image_data = f.read()
             image_b64 = base64.b64encode(image_data).decode("utf-8")
             base_n_prompt = "blurry, low quality, distorted"
-            n_prompt = f"{base_n_prompt}, {negative_prompt}" if negative_prompt else base_n_prompt
+            n_prompt = (
+                f"{base_n_prompt}, {negative_prompt}"
+                if negative_prompt
+                else base_n_prompt
+            )
             payload = {
                 "image": image_b64,
                 "prompt": prompt,
@@ -586,41 +576,23 @@ class SceneGenerationService(AIService):
                 f.write(base64.b64decode(result_b64))
             return str(output_path)
 
-    @torch.inference_mode()
-    async def _process_local(self, image_path: str, prompt: str, negative_prompt: Optional[str] = None) -> str:
-        """Process using local SD 1.5 pipeline."""
-        pipe, device = _load_scene_model()
-        
-        # Move pipe to GPU before generation
-        pipe = pipe.to(device)
+    def _process_solid_color(self, image_path: str, hex_color: str) -> str:
+        """Generate a simple solid color 512x512 image."""
+        if not hex_color.startswith("#"):
+            hex_color = f"#{hex_color}"
 
-        # Force SD to generate an empty scene without objects
-        bg_prompt = f"empty background scene, empty surface, no objects, {prompt}"
-
-        # Typical negative prompt for better quality
-        base_n_prompt = "lowres, bad anatomy, bad quality, worst quality, text, watermark, other objects, other products, bottles, props, distracting elements, cluttered, human, person, hands, arms, fingers"
-        n_prompt = f"{base_n_prompt}, {negative_prompt}" if negative_prompt else base_n_prompt
-        
-        # Use a random seed instead of deterministic 42
-        seed = int(torch.randint(0, 2147483647, (1,)).item())
-        generator = torch.Generator(device=device).manual_seed(seed)
-
-        image = pipe(
-            bg_prompt,
-            negative_prompt=n_prompt,
-            num_inference_steps=30,
-            guidance_scale=7.5,
-            generator=generator,
-        ).images[0]
-
-        # Move pipe to CPU explicitly and clear cache
-        pipe = pipe.to("cpu")
-        torch.cuda.empty_cache()
+        try:
+            # Create a 512x512 image with the specified color
+            img = Image.new("RGB", (512, 512), hex_color)
+        except ValueError:
+            # Fallback if invalid hex code
+            logger.warning(f"Invalid hex color '{hex_color}', falling back to gray")
+            img = Image.new("RGB", (512, 512), "#808080")
 
         output_path = Path(image_path).parent / "scene.png"
-        image.save(output_path, "PNG")
+        img.save(output_path, "PNG")
 
-        logger.info(f"Scene generated via local SD 1.5: {output_path}")
+        logger.info(f"Solid color background ({hex_color}) generated: {output_path}")
         return str(output_path)
 
 
@@ -652,7 +624,9 @@ class RelightingService(AIService):
         """
         background_path = kwargs.get("background_path", "")
         prompt = kwargs.get(
-            "prompt", "top-down view, flat lay photography, product placed exactly on the surface, professional product photography, studio lighting, contact shadow"
+            "prompt",
+            "top-down view, flat lay photography, product placed exactly on the "
+            "surface, professional product photography, studio lighting, contact shadow",
         )
         negative_prompt = kwargs.get("negative_prompt")
 
@@ -679,7 +653,11 @@ class RelightingService(AIService):
 
     @torch.inference_mode()
     async def _process_local_model(
-        self, fg_path: str, bg_path: str, prompt: str, negative_prompt: Optional[str] = None
+        self,
+        fg_path: str,
+        bg_path: str,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
     ) -> str:
         """
         Process using local IC-Light FBC model on GPU.
@@ -695,9 +673,15 @@ class RelightingService(AIService):
         # Use a random seed instead of deterministic 12345
         seed = int(torch.randint(0, 2147483647, (1,)).item())
         a_prompt = "best quality, high detail"
-        
-        base_n_prompt = "lowres, bad anatomy, bad hands, cropped, worst quality, other objects, other products, bottles, props, distracting elements, cluttered, human, person, hands, arms, fingers"
-        n_prompt = f"{base_n_prompt}, {negative_prompt}" if negative_prompt else base_n_prompt
+
+        base_n_prompt = (
+            "lowres, bad anatomy, bad hands, cropped, worst quality, "
+            "other objects, other products, bottles, props, distracting elements, "
+            "cluttered, human, person, hands, arms, fingers"
+        )
+        n_prompt = (
+            f"{base_n_prompt}, {negative_prompt}" if negative_prompt else base_n_prompt
+        )
 
         rng = torch.Generator(device=device).manual_seed(seed)
 
@@ -709,7 +693,7 @@ class RelightingService(AIService):
             fg_img = np.array(bg_gray)
         else:
             fg_img = np.array(fg_pil.convert("RGB"))
-            
+
         fg = _resize_and_pad(fg_img, image_width, image_height)
 
         if bg_path and Path(bg_path).exists():
@@ -776,9 +760,7 @@ class RelightingService(AIService):
         concat_hr = _numpy2pytorch([fg_hr, bg_hr]).to(
             device=vae.device, dtype=vae.dtype
         )
-        concat_hr = (
-            vae.encode(concat_hr).latent_dist.mode() * vae.config.scaling_factor
-        )
+        concat_hr = vae.encode(concat_hr).latent_dist.mode() * vae.config.scaling_factor
         concat_hr = torch.cat([c[None, ...] for c in concat_hr], dim=1)
 
         # Second pass: img2img highres
@@ -797,7 +779,7 @@ class RelightingService(AIService):
 
         # Save result
         output_path = Path(fg_path).parent / "relit.png"
-        
+
         # Convert from [0, 1] float32 to [0, 255] uint8
         final_image_np = (final_images[0] * 255).clip(0, 255).astype(np.uint8)
         out_pil = Image.fromarray(final_image_np)
@@ -807,15 +789,19 @@ class RelightingService(AIService):
             scale_factor = min(hr_w / fg_pil.width, hr_h / fg_pil.height)
             resized_w = int(round(fg_pil.width * scale_factor))
             resized_h = int(round(fg_pil.height * scale_factor))
-            
-            resized_fg_pil = fg_pil.resize((resized_w, resized_h), Image.Resampling.LANCZOS)
-            
+
+            resized_fg_pil = fg_pil.resize(
+                (resized_w, resized_h), Image.Resampling.LANCZOS
+            )
+
             transparent_layer = Image.new("RGBA", (hr_w, hr_h), (0, 0, 0, 0))
             paste_x = (hr_w - resized_w) // 2
             paste_y = (hr_h - resized_h) // 2
             transparent_layer.paste(resized_fg_pil, (paste_x, paste_y))
-            
-            out_pil = Image.alpha_composite(out_pil.convert("RGBA"), transparent_layer).convert("RGB")
+
+            out_pil = Image.alpha_composite(
+                out_pil.convert("RGBA"), transparent_layer
+            ).convert("RGB")
 
         out_pil.save(output_path, "PNG")
 
