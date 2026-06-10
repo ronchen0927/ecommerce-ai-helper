@@ -1,7 +1,36 @@
 # Cloud Run WorkerPool declarative config (IaC) — Celery worker
 #
-# Apply with:
+# ── ONE-TIME SETUP (run once, before the first deploy) ───────────────────────
+# Grant the worker pool's service account the access it needs. The pool below
+# uses the default compute SA; derive its email and bind two roles:
+#
+#   PROJECT_ID=ai-ecommerce-media-studio
+#   PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+#   SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+#
+#   # Write generated images/videos to the assets bucket
+#   gcloud storage buckets add-iam-policy-binding gs://ai-ecommerce-media-studio-assets \
+#     --member="serviceAccount:${SA}" --role="roles/storage.objectAdmin"
+#
+#   # Read the broker URL + Replicate token from Secret Manager
+#   gcloud secrets add-iam-policy-binding celery-broker-url \
+#     --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor"
+#   gcloud secrets add-iam-policy-binding replicate-token \
+#     --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor"
+#
+# ── DEPLOY ───────────────────────────────────────────────────────────────────
 #   gcloud run worker-pools replace deploy/cloudrun-worker.yaml --region=asia-east1
+# (CI normally does this via cloudbuild.yaml Step 4; the line above is the manual path.)
+#
+# ── VERIFY ───────────────────────────────────────────────────────────────────
+#   # Confirm which SA the pool runs as (blank = default compute SA)
+#   gcloud run worker-pools describe ai-ecommerce-media-studio-worker \
+#     --region=asia-east1 --format='value(spec.template.spec.serviceAccountName)'
+#
+#   # Tail logs to confirm the worker booted and is consuming the queue
+#   gcloud logging read \
+#     'resource.type="cloud_run_worker_pool" AND resource.labels.service_name="ai-ecommerce-media-studio-worker"' \
+#     --limit=50 --freshness=1h --format='value(textPayload)'
 #
 # WHY A WORKER POOL (not a regular Cloud Run service):
 #   The API service dispatches Celery tasks onto Redis via send_task(); something
