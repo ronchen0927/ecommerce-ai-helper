@@ -104,3 +104,7 @@ Production deploy via Google Cloud Build → Cloud Run:
 gcloud builds submit --config deploy/cloudbuild.yaml \
   --substitutions=_REGION=asia-east1,_SERVICE_NAME=ai-ecommerce-media-studio
 ```
+
+**Two cloud workloads, one image.** `cloudbuild.yaml` deploys both:
+- The **API** as a Cloud Run *service* (`uvicorn`, scale-to-zero) — Step 3.
+- The **Celery worker** as a Cloud Run *WorkerPool* (`deploy/cloudrun-worker.yaml`) — Step 4. It overrides the image's `uvicorn` CMD with `celery ... worker`. A worker pool (not a regular service) is required because the worker only polls Redis and never listens on `$PORT`, so it would fail a service health check; worker pools are always-CPU-allocated pull consumers. **Without the worker, dispatched tasks sit in Redis and never leave PENDING.** The production image has torch/diffusers stripped, so the worker only runs the Replicate path (local-model fallback would crash — fine, since `REPLICATE_API_TOKEN` is always set in cloud). Worker pools don't autoscale: instance count is fixed via `run.googleapis.com/manualInstanceCount` / `--instances`. The worker needs GCS write + Secret Manager access on its service account; it does **not** need `OPENAI_API_KEY` (storyboard runs in the API route) or `AUTH_*`/`API_KEYS`. The one-time IAM setup, manual deploy, and log-tailing `gcloud` commands are documented in the header of `deploy/cloudrun-worker.yaml`.

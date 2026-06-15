@@ -51,6 +51,26 @@ steps:
       - --set-env-vars=STORAGE_TYPE=gcs,GCS_BUCKET_NAME=ai-ecommerce-media-studio-assets,GCS_PROJECT_ID=${PROJECT_ID},AUTH_ENABLED=true,RATE_LIMIT_ENABLED=true,API_KEYS=ai-media-studio-key-2026
       - --set-secrets=REPLICATE_API_TOKEN=replicate-token:latest,CELERY_BROKER_URL=celery-broker-url:latest,CELERY_RESULT_BACKEND=celery-broker-url:latest
 
+  # Step 4: Deploy the Celery worker (WorkerPool) — consumes the task queue.
+  # Same image, different start command. Without this, tasks dispatched by the API
+  # sit in Redis with no consumer and never leave PENDING.
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - worker-pools
+      - deploy
+      - ${_SERVICE_NAME}-worker
+      - --image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE_NAME}:${_TAG}
+      - --region=${_REGION}
+      - --command=celery
+      - --args=-A,app.core.celery_app,worker,--loglevel=info,--concurrency=2
+      - --instances=1
+      - --memory=1Gi
+      - --cpu=1
+      - --set-env-vars=STORAGE_TYPE=gcs,GCS_BUCKET_NAME=ai-ecommerce-media-studio-assets,GCS_PROJECT_ID=${PROJECT_ID}
+      - --set-secrets=REPLICATE_API_TOKEN=replicate-token:latest,CELERY_BROKER_URL=celery-broker-url:latest,CELERY_RESULT_BACKEND=celery-broker-url:latest
+
 images:
   - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE_NAME}:${_TAG}
   - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/cloud-run-source-deploy/${_SERVICE_NAME}:latest

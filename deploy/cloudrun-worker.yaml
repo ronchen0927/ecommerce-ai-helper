@@ -1,0 +1,111 @@
+# Cloud Run WorkerPool declarative config (IaC) — Celery worker
+#
+# ── ONE-TIME SETUP (run once, before the first deploy) ───────────────────────
+# Grant the worker pool's service account the access it needs. The pool below
+# uses the default compute SA; derive its email and bind two roles:
+#
+#   PROJECT_ID=ai-ecommerce-media-studio
+#   PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+#   SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+#
+#   # Write generated images/videos to the assets bucket
+#   gcloud storage buckets add-iam-policy-binding gs://ai-ecommerce-media-studio-assets \
+#     --member="serviceAccount:${SA}" --role="roles/storage.objectAdmin"
+#
+#   # Read the broker URL + Replicate token from Secret Manager
+#   gcloud secrets add-iam-policy-binding celery-broker-url \
+#     --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor"
+#   gcloud secrets add-iam-policy-binding replicate-token \
+#     --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor"
+#
+# ── DEPLOY ───────────────────────────────────────────────────────────────────
+#   gcloud run worker-pools replace deploy/cloudrun-worker.yaml --region=asia-east1
+# (CI normally does this via cloudbuild.yaml Step 4; the line above is the manual path.)
+#
+# ── VERIFY ───────────────────────────────────────────────────────────────────
+#   # Confirm which SA the pool runs as (blank = default compute SA)
+#   gcloud run worker-pools describe ai-ecommerce-media-studio-worker \
+#     --region=asia-east1 --format='value(spec.template.spec.serviceAccountName)'
+#
+#   # Tail logs to confirm the worker booted and is consuming the queue
+#   gcloud logging read \
+#     'resource.type="cloud_run_worker_pool" AND resource.labels.service_name="ai-ecommerce-media-studio-worker"' \
+#     --limit=50 --freshness=1h --format='value(textPayload)'
+#
+# WHY A WORKER POOL (not a regular Cloud Run service):
+#   The API service dispatches Celery tasks onto Redis via send_task(); something
+#   must consume that queue or every task hangs at PENDING forever. A Celery worker
+#   only polls the broker — it never listens on $PORT — so it CANNOT run as a normal
+#   Cloud Run service (the health check on $PORT would fail). Worker pools are built
+#   for exactly this: pull-based, always-CPU-allocated background consumers with no
+#   HTTP serving. This is the missing half of the deployment.
+#
+# Same image as the API (torch/diffusers stripped, ~0.2GB) — the worker runs the
+# Replicate path, whose heavy compute is offloaded. Only the start command differs.
+
+apiVersion: run.googleapis.com/v1
+kind: WorkerPool
+metadata:
+  name: ai-ecommerce-media-studio-worker
+  labels:
+    app: ai-ecommerce-media-studio
+    component: worker
+    managed-by: cloud-run
+  annotations:
+    run.googleapis.com/description: "Celery worker consuming image/video generation tasks"
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    metadata:
+      annotations:
+        # Worker pools do not autoscale — pin a fixed instance count.
+        # One instance runs `celery ... --concurrency=2`, i.e. 2 concurrent tasks.
+        # Bump manualInstanceCount to add more consumers if the queue backs up.
+        run.googleapis.com/scalingMode: manual
+        run.googleapis.com/manualInstanceCount: "1"
+    spec:
+      containers:
+        - image: asia-east1-docker.pkg.dev/ai-ecommerce-media-studio/cloud-run-source-deploy/ai-ecommerce-media-studio:latest
+          # Override the image's uvicorn CMD — run the Celery worker instead.
+          command:
+            - celery
+          args:
+            - "-A"
+            - "app.core.celery_app"
+            - "worker"
+            - "--loglevel=info"
+            - "--concurrency=2"
+          resources:
+            limits:
+              memory: 1Gi
+              cpu: "1"
+          env:
+            - name: REPLICATE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: replicate-token
+            - name: CELERY_BROKER_URL
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: celery-broker-url
+            - name: CELERY_RESULT_BACKEND
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: celery-broker-url
+            # Worker writes results to GCS — same storage config as the API service.
+            - name: STORAGE_TYPE
+              value: "gcs"
+            - name: GCS_BUCKET_NAME
+              value: "ai-ecommerce-media-studio-assets"
+            - name: GCS_PROJECT_ID
+              value: "ai-ecommerce-media-studio"
+            # NOTE: no OPENAI_API_KEY here — storyboard (GPT Vision) runs in the API
+            # route, not the worker. No AUTH_*/API_KEYS either — those gate the HTTP
+            # entrypoint, which the worker doesn't have.
+      # Uses the default compute service account. It must have write access to the
+      # GCS bucket (roles/storage.objectAdmin on ai-ecommerce-media-studio-assets)
+      # and Secret Manager access (roles/secretmanager.secretAccessor).
+      serviceAccountName: ""
